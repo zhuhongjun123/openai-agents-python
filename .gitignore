@@ -103,6 +103,9 @@ celerybeat.pid
 # Environments
 .python-version
 .env*
+!.env.example
+corpus/
+eval_output/
 .venv
 .venv*
 env/
