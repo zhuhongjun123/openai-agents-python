@@ -33,7 +33,6 @@ from .. import _debug
 from .._mcp_tool_metadata import collect_mcp_list_tools_metadata
 from .._tool_identity import (
     build_function_tool_lookup_map,
-    get_function_tool_lookup_key,
     get_function_tool_lookup_key_for_call,
     get_function_tool_lookup_key_for_tool,
     get_function_tool_qualified_name,
@@ -41,11 +40,16 @@ from .._tool_identity import (
     get_tool_call_qualified_name,
     get_tool_call_trace_name,
     normalize_tool_call_for_function_tool,
+    resolve_tool_name_collisions,
     should_allow_bare_name_approval_alias,
 )
 from ..agent import Agent, ToolsToFinalOutputResult
 from ..agent_output import AgentOutputSchemaBase
-from ..agent_tool_state import get_agent_tool_state_scope, peek_agent_tool_run_result
+from ..agent_tool_state import (
+    drop_agent_tool_run_result,
+    get_agent_tool_state_scope,
+    peek_agent_tool_run_result,
+)
 from ..exceptions import ModelBehaviorError, ModelRefusalError, UserError
 from ..handoffs import Handoff, HandoffInputData, HandoffInputFilter, nest_handoff_history
 from ..handoffs.history import (
@@ -166,6 +170,7 @@ from .tool_planning import (
     _make_unique_item_appender,
     _select_function_tool_runs_for_resume,
 )
+from .turn_preparation import get_handoffs, get_output_schema
 
 _DEFAULT_NEST_HANDOFF_HISTORY = nest_handoff_history
 
@@ -1302,6 +1307,7 @@ async def resolve_interrupted_turn(
         execution_agent,
         context_wrapper,
     )
+    local_function_tool_ids = {id(tool) for tool in available_function_tools}
     approval_rebuild_function_tools = available_function_tools
     if pending_approval_items and execution_agent.mcp_servers:
         approval_rebuild_function_tools = [
@@ -1309,6 +1315,17 @@ async def resolve_interrupted_turn(
             for tool in await execution_agent.get_all_tools(context_wrapper)
             if isinstance(tool, FunctionTool)
         ]
+    available_handoffs = await get_handoffs(execution_agent, context_wrapper)
+    resolved_function_tools, _ = resolve_tool_name_collisions(
+        approval_rebuild_function_tools,
+        available_handoffs,
+        collision_policy=run_config.tool_name_collision_policy,
+    )
+    approval_rebuild_function_tools = cast(list[FunctionTool], resolved_function_tools)
+    resolved_function_tool_map = build_function_tool_lookup_map(approval_rebuild_function_tools)
+    available_function_tools = [
+        tool for tool in approval_rebuild_function_tools if id(tool) in local_function_tool_ids
+    ]
     program_call_ids, completed_program_call_ids = _collect_program_parent_state(
         [*original_pre_step_items, *new_response.output],
         server_manages_conversation=server_manages_conversation,
@@ -1316,136 +1333,246 @@ async def resolve_interrupted_turn(
     programmatic_tool_present = any(
         isinstance(tool, ProgrammaticToolCallingTool) for tool in execution_agent.tools
     )
+    output_schema = get_output_schema(execution_agent)
 
-    async def _rebuild_function_runs_from_approvals() -> list[ToolRunFunction]:
-        if not pending_approval_items:
-            return []
-        tool_map = build_function_tool_lookup_map(approval_rebuild_function_tools)
-        existing_pending_call_ids: set[str] = set()
-        for existing_pending in pending_interruptions:
-            if isinstance(existing_pending, ToolApprovalItem):
-                existing_call_id = extract_tool_call_id(existing_pending.raw_item)
-                if existing_call_id:
-                    existing_pending_call_ids.add(existing_call_id)
-        rebuilt_runs: list[ToolRunFunction] = []
+    def _add_unmatched_pending(approval: ToolApprovalItem) -> None:
+        call_id = extract_tool_call_id(approval.raw_item)
+        if not call_id:
+            _add_pending_interruption(approval)
+            return
+        approval_status = context_wrapper.get_approval_status(
+            approval.tool_name or "",
+            call_id,
+            tool_namespace=approval.tool_namespace,
+            existing_pending=approval,
+        )
+        if approval_status is None:
+            _add_pending_interruption(approval)
 
-        def _add_unmatched_pending(approval: ToolApprovalItem) -> None:
-            call_id = extract_tool_call_id(approval.raw_item)
-            if not call_id:
-                _add_pending_interruption(approval)
-                return
-            tool_name = approval.tool_name or ""
+    def _coerce_approval_function_call(
+        approval: ToolApprovalItem,
+    ) -> ResponseFunctionToolCall | None:
+        raw = approval.raw_item
+        if get_mapping_or_attr(raw, "type") != "function_call":
+            return None
+        if isinstance(raw, ResponseFunctionToolCall):
+            return raw
+        name = get_mapping_or_attr(raw, "name")
+        call_id = extract_tool_call_id(raw)
+        arguments = get_mapping_or_attr(raw, "arguments")
+        if not (isinstance(name, str) and isinstance(call_id, str) and isinstance(arguments, str)):
+            return None
+        status = get_mapping_or_attr(raw, "status")
+        valid_status: Literal["in_progress", "completed", "incomplete"] | None = None
+        if isinstance(status, str) and status in ("in_progress", "completed", "incomplete"):
+            valid_status = cast(Any, status)
+        tool_call_payload: dict[str, Any] = {
+            "type": "function_call",
+            "name": name,
+            "call_id": call_id,
+            "arguments": arguments,
+            "status": valid_status,
+        }
+        namespace = get_tool_call_namespace(raw) or approval.tool_namespace
+        if namespace is not None:
+            tool_call_payload["namespace"] = namespace
+        caller = get_mapping_or_attr(raw, "caller")
+        if caller is not None:
+            tool_call_payload["caller"] = caller
+        return ResponseFunctionToolCall(**tool_call_payload)
+
+    def _is_terminal_function_run(run: ToolRunFunction) -> bool:
+        call_id = extract_tool_call_id(run.tool_call)
+        if not call_id or not _has_output_item(call_id, "function_call_output"):
+            return False
+        pending_run_result = peek_agent_tool_run_result(
+            run.tool_call,
+            scope_id=tool_state_scope_id,
+        )
+        return not (pending_run_result and getattr(pending_run_result, "interruptions", None))
+
+    def _is_sdk_json_tool_run(run: ToolRunFunction) -> bool:
+        return (
+            output_schema is not None
+            and run.tool_call.name == "json_tool_call"
+            and run.function_tool.name == "json_tool_call"
+            and not run.function_tool._emit_tool_origin
+        )
+
+    def _current_function_tool(
+        tool_call: ResponseFunctionToolCall,
+        approval: ToolApprovalItem | None = None,
+    ) -> FunctionTool | None:
+        lookup_key = approval.tool_lookup_key if approval is not None else None
+        if lookup_key is None:
+            lookup_key = get_function_tool_lookup_key_for_call(tool_call)
+        return resolved_function_tool_map.get(lookup_key) if lookup_key is not None else None
+
+    def _rebind_function_run(
+        run: ToolRunFunction,
+        resolved_tool: FunctionTool,
+    ) -> ToolRunFunction:
+        if resolved_tool is run.function_tool:
+            return run
+        drop_agent_tool_run_result(run.tool_call, scope_id=tool_state_scope_id)
+        tool_call = cast(
+            ResponseFunctionToolCall,
+            normalize_tool_call_for_function_tool(run.tool_call, resolved_tool),
+        )
+        return ToolRunFunction(tool_call=tool_call, function_tool=resolved_tool)
+
+    def _validate_function_run(run: ToolRunFunction) -> None:
+        ensure_programmatic_tool_call_parent(
+            tool_call=run.tool_call,
+            programmatic_tool_present=programmatic_tool_present,
+            program_call_ids=program_call_ids,
+            completed_program_call_ids=completed_program_call_ids,
+            agent_name=public_agent.name,
+        )
+        ensure_tool_caller_allowed(
+            tool_call=run.tool_call,
+            allowed_callers=run.function_tool.allowed_callers,
+            tool_name=(
+                get_function_tool_qualified_name(run.function_tool) or run.function_tool.name
+            ),
+            agent_name=public_agent.name,
+        )
+
+    missing_queued_function_tools: list[ToolRunFunctionNotFound] = []
+
+    def _record_missing_function_call(tool_call: ResponseFunctionToolCall) -> None:
+        drop_agent_tool_run_result(tool_call, scope_id=tool_state_scope_id)
+        qualified_name = get_tool_call_qualified_name(tool_call) or tool_call.name
+        _error_tracing.attach_error_to_current_span(
+            SpanError(message="Tool not found", data={"tool_name": qualified_name})
+        )
+        if run_config.tool_not_found_behavior != "return_error_to_model":
+            raise ModelBehaviorError(
+                f"Tool {qualified_name} not found in agent {public_agent.name}"
+            )
+        missing_queued_function_tools.append(
+            ToolRunFunctionNotFound(tool_call=tool_call, tool_name=qualified_name)
+        )
+
+    async def _record_missing_function_rejection(
+        approval: ToolApprovalItem,
+        tool_call: ResponseFunctionToolCall,
+    ) -> None:
+        call_id = tool_call.call_id
+        if call_id in rejected_function_call_ids:
+            return
+        rejection_message = await resolve_approval_rejection_message(
+            context_wrapper=context_wrapper,
+            run_config=run_config,
+            tool_type="function",
+            tool_name=get_tool_call_trace_name(tool_call) or tool_call.name,
+            call_id=call_id,
+            tool_namespace=get_tool_call_namespace(tool_call),
+            tool_lookup_key=approval.tool_lookup_key,
+            existing_pending=approval,
+        )
+        rejected_function_outputs.append(
+            function_rejection_item(
+                public_agent,
+                tool_call,
+                rejection_message=rejection_message,
+                output_json_schema=None,
+                scope_id=tool_state_scope_id,
+                tool_origin=approval.tool_origin,
+            )
+        )
+        rejected_function_call_ids.add(call_id)
+
+    queued_function_tool_runs: list[ToolRunFunction] = []
+    accounted_function_call_ids: set[str] = set()
+    for run in processed_response.functions:
+        call_id = run.tool_call.call_id
+        if _is_terminal_function_run(run):
+            accounted_function_call_ids.add(call_id)
+            continue
+
+        approval = approval_items_by_call_id.get(call_id)
+        resolved_tool = _current_function_tool(run.tool_call)
+        if resolved_tool is not None:
+            queued_function_tool_runs.append(_rebind_function_run(run, resolved_tool))
+            accounted_function_call_ids.add(call_id)
+            continue
+        if _is_sdk_json_tool_run(run):
+            queued_function_tool_runs.append(run)
+            accounted_function_call_ids.add(call_id)
+            continue
+        if approval is not None:
             approval_status = context_wrapper.get_approval_status(
-                tool_name,
+                approval.tool_name or run.tool_call.name,
                 call_id,
                 tool_namespace=approval.tool_namespace,
                 existing_pending=approval,
             )
             if approval_status is None:
                 _add_pending_interruption(approval)
+                accounted_function_call_ids.add(call_id)
+                continue
+            if approval_status is False:
+                drop_agent_tool_run_result(run.tool_call, scope_id=tool_state_scope_id)
+                await _record_function_rejection(call_id, run.tool_call, run.function_tool)
+                accounted_function_call_ids.add(call_id)
+                continue
+        _record_missing_function_call(run.tool_call)
+        accounted_function_call_ids.add(call_id)
 
-        for approval in pending_approval_items:
-            if not isinstance(approval, ToolApprovalItem):
-                continue
-            if not _approval_matches_agent(approval):
-                _add_unmatched_pending(approval)
-                continue
-            raw = approval.raw_item
-            raw_type = get_mapping_or_attr(raw, "type")
-            if raw_type != "function_call":
-                _add_unmatched_pending(approval)
-                continue
-            name = get_mapping_or_attr(raw, "name")
-            namespace = get_tool_call_namespace(raw)
-            if namespace is None and isinstance(approval.tool_namespace, str):
-                namespace = approval.tool_namespace
-            approval_key = getattr(approval, "tool_lookup_key", None)
-            if approval_key is None:
-                approval_key = get_function_tool_lookup_key(name, namespace)
-            resolved_tool = tool_map.get(approval_key) if approval_key is not None else None
-            if not (isinstance(name, str) and resolved_tool is not None):
-                _add_unmatched_pending(approval)
-                continue
-
-            rebuilt_call_id: str | None
-            arguments: str | None
-            tool_call: ResponseFunctionToolCall
-            if isinstance(raw, ResponseFunctionToolCall):
-                rebuilt_call_id = raw.call_id
-                arguments = raw.arguments
-                tool_call = raw
+    for approval in pending_approval_items:
+        if not _approval_matches_agent(approval):
+            _add_unmatched_pending(approval)
+            continue
+        tool_call = _coerce_approval_function_call(approval)
+        if tool_call is None:
+            if get_mapping_or_attr(approval.raw_item, "type") == "function_call":
+                _add_pending_interruption(approval)
             else:
-                rebuilt_call_id = extract_tool_call_id(raw)
-                arguments = get_mapping_or_attr(raw, "arguments") or "{}"
-                status = get_mapping_or_attr(raw, "status")
-                if not (isinstance(rebuilt_call_id, str) and isinstance(arguments, str)):
-                    _add_unmatched_pending(approval)
-                    continue
-                valid_status: Literal["in_progress", "completed", "incomplete"] | None = None
-                if isinstance(status, str) and status in (
-                    "in_progress",
-                    "completed",
-                    "incomplete",
-                ):
-                    valid_status = status  # type: ignore[assignment]
-                tool_call_payload: dict[str, Any] = {
-                    "type": "function_call",
-                    "name": name,
-                    "call_id": rebuilt_call_id,
-                    "arguments": arguments,
-                    "status": valid_status,
-                }
-                if namespace is not None:
-                    tool_call_payload["namespace"] = namespace
-                caller = get_mapping_or_attr(raw, "caller")
-                if caller is not None:
-                    tool_call_payload["caller"] = caller
-                tool_call = ResponseFunctionToolCall(**tool_call_payload)
-            tool_call = cast(
+                _add_unmatched_pending(approval)
+            continue
+        call_id = tool_call.call_id
+        if call_id in accounted_function_call_ids or _has_output_item(
+            call_id, "function_call_output"
+        ):
+            continue
+        resolved_tool = _current_function_tool(tool_call, approval)
+        if resolved_tool is not None:
+            normalized_call = cast(
                 ResponseFunctionToolCall,
                 normalize_tool_call_for_function_tool(tool_call, resolved_tool),
             )
-            ensure_programmatic_tool_call_parent(
-                tool_call=tool_call,
-                programmatic_tool_present=programmatic_tool_present,
-                program_call_ids=program_call_ids,
-                completed_program_call_ids=completed_program_call_ids,
-                agent_name=public_agent.name,
+            queued_function_tool_runs.append(
+                ToolRunFunction(tool_call=normalized_call, function_tool=resolved_tool)
             )
-            ensure_tool_caller_allowed(
-                tool_call=tool_call,
-                allowed_callers=resolved_tool.allowed_callers,
-                tool_name=get_function_tool_qualified_name(resolved_tool) or resolved_tool.name,
-                agent_name=public_agent.name,
-            )
+            accounted_function_call_ids.add(call_id)
+            continue
+        approval_status = context_wrapper.get_approval_status(
+            approval.tool_name or tool_call.name,
+            call_id,
+            tool_namespace=approval.tool_namespace,
+            existing_pending=approval,
+        )
+        if approval_status is None:
+            _add_pending_interruption(approval)
+        elif approval_status is False:
+            await _record_missing_function_rejection(approval, tool_call)
+        else:
+            _record_missing_function_call(tool_call)
+        accounted_function_call_ids.add(call_id)
 
-            if not (isinstance(rebuilt_call_id, str) and isinstance(arguments, str)):
-                _add_unmatched_pending(approval)
-                continue
-
-            approval_status = context_wrapper.get_approval_status(
-                name,
-                rebuilt_call_id,
-                tool_namespace=namespace,
-                existing_pending=approval,
-            )
-            if approval_status is False:
-                await _record_function_rejection(
-                    rebuilt_call_id,
-                    tool_call,
-                    resolved_tool,
-                )
-                continue
-            if approval_status is None:
-                if rebuilt_call_id not in existing_pending_call_ids:
-                    _add_pending_interruption(approval)
-                    existing_pending_call_ids.add(rebuilt_call_id)
-                continue
-            rebuilt_runs.append(ToolRunFunction(function_tool=resolved_tool, tool_call=tool_call))
-        return rebuilt_runs
+    for run in queued_function_tool_runs:
+        approval_status = context_wrapper.get_approval_status(
+            run.function_tool.name,
+            run.tool_call.call_id,
+            tool_namespace=get_tool_call_namespace(run.tool_call),
+            existing_pending=approval_items_by_call_id.get(run.tool_call.call_id),
+        )
+        if approval_status is not False:
+            _validate_function_run(run)
 
     function_tool_runs = await _select_function_tool_runs_for_resume(
-        processed_response.functions,
+        queued_function_tool_runs,
         approval_items_by_call_id=approval_items_by_call_id,
         context_wrapper=context_wrapper,
         needs_approval_checker=_function_requires_approval,
@@ -1465,21 +1592,6 @@ async def resolve_interrupted_turn(
             ),
         ),
     )
-
-    rebuilt_function_tool_runs = await _rebuild_function_runs_from_approvals()
-    if rebuilt_function_tool_runs:
-        existing_call_ids: set[str] = set()
-        for run in function_tool_runs:
-            call_id = extract_tool_call_id(run.tool_call)
-            if call_id:
-                existing_call_ids.add(call_id)
-        for run in rebuilt_function_tool_runs:
-            call_id = extract_tool_call_id(run.tool_call)
-            if call_id and call_id in existing_call_ids:
-                continue
-            function_tool_runs.append(run)
-            if call_id:
-                existing_call_ids.add(call_id)
 
     pending_computer_actions: list[ToolRunComputerAction] = []
     for action in processed_response.computer_actions:
@@ -1575,6 +1687,13 @@ async def resolve_interrupted_turn(
         shell_results=shell_results,
         apply_patch_results=apply_patch_results,
         local_shell_results=[],
+    ):
+        append_if_new(item)
+    for item in await _build_tool_not_found_output_items(
+        agent=public_agent,
+        calls=missing_queued_function_tools,
+        context_wrapper=context_wrapper,
+        run_config=run_config,
     ):
         append_if_new(item)
     for rejection_item in rejected_function_outputs:
